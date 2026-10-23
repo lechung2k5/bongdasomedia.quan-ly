@@ -1,0 +1,266 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  STAFF
+  FREELANCER
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum OperationalStatus {
+  IDLE
+  MOVING
+  WORKING
+}
+
+enum EquipmentStatus {
+  AVAILABLE
+  IN_USE
+  MAINTENANCE
+  BROKEN
+}
+
+enum JobType {
+  LIVESTREAM
+  PHOTOSHOOT
+  BOTH
+}
+
+enum JobStatus {
+  PENDING
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum Duty {
+  VMIX_OPERATOR
+  CAMERAMAN
+  CASTER
+  PHOTOGRAPHER
+  SUPPORT
+}
+
+enum AssignmentCheckStatus {
+  PENDING
+  CONFIRMED
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionCategory {
+  CLIENT_PAYMENT
+  STAFF_SALARY
+  EQUIPMENT_PURCHASE
+  MAINTENANCE
+  TRAVEL
+  OTHER
+}
+
+model User {
+  id                   Int                       @id @default(autoincrement())
+  name                 String
+  phone                String?                   @unique
+  password             String                    @default("$2a$10$wT/YlA889.B/p8gq4uHjue9hY7Y1q2U.h2X7y6L2I3C0v9B.O0H8.") // staff123
+  address_district     String?                   // Gò Vấp, Bình Chánh, Tân Bình, Bình Tân...
+  role                 Role                      @default(STAFF)
+  skills               String?                   // Bình luận viên, Kỹ thuật viên, Quản lý, Quay phim, Chụp hình...
+  status               UserStatus                @default(ACTIVE)
+  operational_status   OperationalStatus         @default(IDLE)
+  is_app_active        Boolean                   @default(true) // Bật/Tắt ứng dụng & chia sẻ vị trí
+  avatar_url           String?
+  current_lat          Float?
+  current_lng          Float?
+  last_location_update DateTime?
+
+  jobStaffs            JobStaff[]
+  transportAssignments JobEquipmentAssignment[]  @relation("TransportByUser")
+  heldEquipments       Equipment[]               @relation("HeldByUser")
+  transactionsRecorded Transaction[]             @relation("RecordedByUser")
+  sessions             Session[]
+  notifications        Notification[]
+
+  created_at           DateTime                  @default(now())
+  updated_at           DateTime                  @updatedAt
+}
+
+model Session {
+  id            String   @id @default(cuid())
+  session_token String   @unique
+  user_id       Int
+  user          User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user_agent    String?
+  device_name   String?
+  ip_address    String?
+  is_active     Boolean  @default(true)
+  expires_at    DateTime
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([user_id])
+  @@index([session_token])
+}
+
+model Location {
+  id         Int      @id @default(autoincrement())
+  name       String
+  address    String?
+  latitude   Float?
+  longitude  Float?
+  jobs       Job[]
+
+  created_at DateTime @default(now())
+}
+
+model EquipmentCategory {
+  id         Int         @id @default(autoincrement())
+  name       String      // Laptop, PC; Máy quay; Loa; Chân quay; Dây điện
+  equipments Equipment[]
+}
+
+model Equipment {
+  id                Int                       @id @default(autoincrement())
+  category_id       Int
+  category          EquipmentCategory         @relation(fields: [category_id], references: [id], onDelete: Cascade)
+  name              String
+  image_url         String?                   // Ảnh thiết bị lưu trên AWS S3
+  status            EquipmentStatus           @default(AVAILABLE)
+  qr_code           String?                   @unique
+  current_holder_id Int?
+  currentHolder     User?                     @relation("HeldByUser", fields: [current_holder_id], references: [id], onDelete: SetNull)
+  current_location  String?                   @default("Kho văn phòng") // Vị trí hiện tại: Kho văn phòng, Sân bóng, Nhân viên giữ...
+  assignments       JobEquipmentAssignment[]
+
+  created_at        DateTime                  @default(now())
+  updated_at        DateTime                  @updatedAt
+}
+
+model Job {
+  id                   Int                       @id @default(autoincrement())
+  title                String
+  location_id          Int
+  location             Location                  @relation(fields: [location_id], references: [id])
+  job_type             JobType                   @default(LIVESTREAM)
+  match_type           String?                   // Giao hữu sân 7, Giải sân 7, Sự kiện ngoài trời...
+  match_count          Int                       @default(1) // Số trận
+  pitch_count          Int                       @default(1) // Số sân
+  camera_count         Int                       @default(1) // Số cam
+  has_photo            Boolean                   @default(false) // Có chụp hình
+  live_price           Float                     @default(0) // Giá live phát sóng
+  photo_fee            Float                     @default(0) // Phụ phí chụp ảnh
+  duration_hours       Float                     @default(1.5) // Số giờ / thời lượng
+  is_deposited         Boolean                   @default(false) // Đã nhận cọc
+  deposit_amount       Float                     @default(0) // Số tiền cọc
+  start_time           DateTime
+  end_time             DateTime
+  price                Float                     @default(0) // Tổng tiền hợp đồng thu từ khách
+  payment_status       String                    @default("UNPAID") // UNPAID (Chưa thanh toán), PARTIAL (Đã cọc), PAID (Đã thanh toán đủ)
+  paid_amount          Float                     @default(0) // Số tiền thực tế khách đã trả
+  payment_proof_url    String?                   // Ảnh bill khách chuyển khoản
+  payment_notes        String?                   // Ghi chú thanh toán của khách
+  status               JobStatus                 @default(PENDING)
+  notes                String?
+  equipment_photo_url  String?                   // Ảnh đồ cần lấy do admin chụp chuẩn bị sẵn
+
+  staff                JobStaff[]
+  equipmentAssignments JobEquipmentAssignment[]
+  transactions         Transaction[]
+  notifications        Notification[]
+
+  created_at           DateTime                  @default(now())
+  updated_at           DateTime                  @updatedAt
+}
+
+model JobStaff {
+  id               Int       @id @default(autoincrement())
+  job_id           Int
+  job              Job       @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  user_id          Int?
+  user             User?     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  external_name    String?   // Tên nhân sự gọi ngoài nếu không có tài khoản
+  external_duty    String?   // Vai trò của nhân sự ngoài
+  duty             Duty      @default(CAMERAMAN) // VMIX_OPERATOR, CAMERAMAN, CASTER...
+  payout_amount    Float     @default(0)         // Tiền công trả cho nhân sự ca này
+  payout_status    String    @default("UNPAID")  // UNPAID (chưa nhận), PAID (đã nhận)
+  paid_at          DateTime? // Ngày thực nhận lương
+  payout_proof_url String?   // Ảnh minh chứng bill chuyển khoản lương cho staff
+  payout_notes     String?   // Ghi chú thanh toán lương
+
+  created_at       DateTime  @default(now())
+}
+
+model JobEquipmentAssignment {
+  id                   Int                   @id @default(autoincrement())
+  job_id               Int
+  job                  Job                   @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  equipment_id         Int
+  equipment            Equipment             @relation(fields: [equipment_id], references: [id], onDelete: Cascade)
+  transport_by_user_id Int                   // Ai là người chở món đồ này
+  transportByUser      User                  @relation("TransportByUser", fields: [transport_by_user_id], references: [id], onDelete: Restrict)
+  check_in_status      AssignmentCheckStatus @default(PENDING) // Xác nhận lấy đồ đi
+  check_out_status     AssignmentCheckStatus @default(PENDING) // Xác nhận trả lại đồ
+  check_in_time        DateTime?
+  check_out_time       DateTime?
+  stadium_check_in_time DateTime?             // Check-in khi đã tới sân bóng
+  check_in_photo_url   String?               // Ảnh chụp toàn bộ đồ chất lên xe tải lên S3
+  check_out_photo_url  String?               // Ảnh chụp đồ kiểm kê khi trả về kho tải lên S3
+  handover_notes       String?               // Ghi chú khi giao đồ
+  check_out_notes      String?               // Ghi chú khi trả đồ (để lại đâu, tình trạng...)
+  return_location_type String?               @default("WAREHOUSE") // WAREHOUSE, STADIUM, KEEP, OTHER
+  return_location_name String?               // Tên vị trí cụ thể (ví dụ: Sân bóng Hoàn Anh, Nhà riêng Lê Chung...)
+
+  created_at           DateTime              @default(now())
+  updated_at           DateTime              @updatedAt
+}
+
+model Transaction {
+  id               Int                 @id @default(autoincrement())
+  job_id           Int?
+  job              Job?                @relation(fields: [job_id], references: [id], onDelete: SetNull)
+  type             TransactionType
+  category         TransactionCategory
+  amount           Float
+  recorded_by      Int
+  recorder         User                @relation("RecordedByUser", fields: [recorded_by], references: [id])
+  notes            String?
+  receipt_url      String?             // Ảnh hóa đơn / bill chứng từ thanh toán, mua sắm
+  payment_method   String?             @default("BANK_TRANSFER") // BANK_TRANSFER, CASH
+  status           String?             @default("COMPLETED") // COMPLETED, PENDING
+  transaction_date DateTime            @default(now())
+
+  created_at       DateTime            @default(now())
+}
+
+model Notification {
+  id         Int      @id @default(autoincrement())
+  type       String   // CHECK_IN, CHECK_OUT, STADIUM_CHECK_IN, LATE_WARNING, APP_STATUS, SYSTEM
+  title      String
+  message    String
+  user_id    Int?
+  user       User?    @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  job_id     Int?
+  job        Job?     @relation(fields: [job_id], references: [id], onDelete: SetNull)
+  photo_url  String?  // Ảnh đính kèm (ảnh lấy đồ, ảnh trả đồ, ảnh bằng chứng)
+  is_read    Boolean  @default(false)
+  metadata   String?  // JSON string (distance_km, eta_minutes, late_minutes, stadium_name)
+  created_at DateTime @default(now())
+
+  @@index([is_read])
+  @@index([created_at])
+}
