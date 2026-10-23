@@ -9,7 +9,8 @@
     "lint": "eslint",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
-    "prisma:seed": "node prisma/seed.js"
+    "prisma:seed": "node prisma/seed.js",
+    "db:import": "node scripts/import_production_data.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1155.0",
