@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@import "@goongmaps/goong-js/dist/goong-js.css";
 
 /* Đảm bảo Goong Maps WebGL Canvas luôn chiếm trọn 100% khung hiển thị */
 .goongjs-map,
