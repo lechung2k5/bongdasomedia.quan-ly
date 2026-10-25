@@ -119,6 +119,15 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
   const [gpsPermissionState, setGpsPermissionState] = useState<'prompt' | 'granted' | 'denied' | 'unknown'>('unknown');
   const [gpsErrorText, setGpsErrorText] = useState<string | null>(null);
   const [isRequestingGps, setIsRequestingGps] = useState(false);
+  const [gpsDiagnosticInfo, setGpsDiagnosticInfo] = useState<{
+    code?: number;
+    message?: string;
+    protocol?: string;
+    host?: string;
+    isHttps?: boolean;
+    isInApp?: boolean;
+  } | null>(null);
+  const [showGpsDiagnosticsModal, setShowGpsDiagnosticsModal] = useState(false);
   const lastGpsPushTimeRef = useRef<number>(0);
 
   // Payout action loading
@@ -264,44 +273,89 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
     }
   };
 
-  // Hàm chủ động yêu cầu quyền truy cập GPS từ trình duyệt
+  // Hàm chủ động yêu cầu quyền truy cập GPS từ trình duyệt (Có tự động fallback Wifi/Cell nếu GPS vệ tinh timeout khi ở trong nhà)
   const requestLocationPermissionAndPush = (force = false, targetStatus?: string) => {
     if (typeof window === 'undefined' || !('geolocation' in navigator)) {
-      setGpsErrorText('Trình duyệt của bạn không hỗ trợ định vị GPS.');
+      const msg = 'Trình duyệt của bạn không hỗ trợ định vị GPS.';
+      setGpsErrorText(msg);
+      if (force) setStatusMessage(`❌ ${msg}`);
       return;
     }
 
     setIsRequestingGps(true);
     setGpsErrorText(null);
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setIsRequestingGps(false);
-        setGpsPermissionState('granted');
-        setGpsErrorText(null);
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        setCurrentCoord({ lat, lng });
-        pushLocationUpdate(lat, lng, targetStatus || currentUser?.operational_status, true);
-        if (force) {
-          setStatusMessage('✓ Đã đồng bộ tọa độ GPS thành công!');
-        }
-      },
-      (err) => {
-        setIsRequestingGps(false);
-        console.warn('Geolocation error:', err);
-        if (err.code === 1) { // PERMISSION_DENIED
-          setGpsPermissionState('denied');
-          setGpsErrorText('Bạn đã từ chối quyền vị trí. Vui lòng cho phép trong cài đặt trang web trên điện thoại.');
-        } else if (err.code === 2) { // POSITION_UNAVAILABLE
-          setGpsErrorText('Không thể xác định vị trí. Vui lòng bật GPS trên điện thoại.');
-        } else if (err.code === 3) { // TIMEOUT
-          setGpsErrorText('Quá thời gian kết nối GPS. Hãy thử lại.');
+    const onGpsSuccess = (pos: GeolocationPosition) => {
+      setIsRequestingGps(false);
+      setGpsPermissionState('granted');
+      setGpsErrorText(null);
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      setCurrentCoord({ lat, lng });
+      pushLocationUpdate(lat, lng, targetStatus || currentUser?.operational_status, true);
+      if (force) {
+        setStatusMessage('✓ Đã đồng bộ tọa độ GPS mới nhất thành công!');
+      }
+    };
+
+    const onGpsError = (err: GeolocationPositionError) => {
+      setIsRequestingGps(false);
+      console.warn('Geolocation error:', err);
+
+      const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+      const isLocalhost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+      const isInApp = typeof navigator !== 'undefined' && /FBAN|FBAV|Instagram|Line|Zalo|TikTok|MicroMessenger/i.test(navigator.userAgent || '');
+
+      setGpsDiagnosticInfo({
+        code: err.code,
+        message: err.message,
+        protocol: typeof window !== 'undefined' ? window.location.protocol : '',
+        host: typeof window !== 'undefined' ? window.location.host : '',
+        isHttps: isHttps || isLocalhost,
+        isInApp,
+      });
+
+      let errDesc = '';
+      if (err.code === 1) { // PERMISSION_DENIED
+        setGpsPermissionState('denied');
+        if (!isHttps && !isLocalhost) {
+          errDesc = 'Trình duyệt chặn GPS do web đang chạy qua HTTP. Cần cài đặt HTTPS cho domain.';
+        } else if (isInApp) {
+          errDesc = 'Trình duyệt Zalo/Messenger chặn quyền GPS. Vui lòng mở bằng Safari/Chrome.';
         } else {
-          setGpsErrorText(err.message || 'Không thể lấy tọa độ từ trình duyệt');
+          errDesc = 'Quyền vị trí bị chặn. Vui lòng bật lại trong Cài đặt Safari/Chrome trên điện thoại.';
+        }
+      } else if (err.code === 2) { // POSITION_UNAVAILABLE
+        errDesc = 'Không có tín hiệu vị trí. Hãy bật GPS (Vị trí) trong cài đặt điện thoại.';
+      } else if (err.code === 3) { // TIMEOUT
+        errDesc = 'Hết thời gian chờ GPS (do đang ở trong nhà hoặc sóng yếu). Vui lòng thử lại.';
+      } else {
+        errDesc = err.message || 'Không thể lấy tọa độ từ trình duyệt';
+      }
+
+      setGpsErrorText(errDesc);
+      if (force) {
+        setStatusMessage(`❌ ${errDesc}`);
+        setShowGpsDiagnosticsModal(true);
+      }
+    };
+
+    // Bước 1: Thử lấy GPS chính xác cao (vệ tinh) với timeout 8s
+    navigator.geolocation.getCurrentPosition(
+      onGpsSuccess,
+      (err) => {
+        // Bước 2: Nếu lỗi do Timeout (code 3) hoặc Không có tín hiệu (code 2), thử lại ngay với độ chính xác mạng Wifi/Cell
+        if (err.code === 2 || err.code === 3) {
+          navigator.geolocation.getCurrentPosition(
+            onGpsSuccess,
+            onGpsError,
+            { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 }
+          );
+        } else {
+          onGpsError(err);
         }
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
     );
   };
 
@@ -1898,6 +1952,19 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
               </button>
             </div>
 
+            {gpsErrorText && (
+              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-2.5 flex items-center justify-between text-xs text-rose-800 shadow-2xs">
+                <span className="truncate pr-2">⚠️ {gpsErrorText}</span>
+                <button
+                  type="button"
+                  onClick={() => setShowGpsDiagnosticsModal(true)}
+                  className="underline font-bold text-rose-700 shrink-0 cursor-pointer text-[11px]"
+                >
+                  Xem hướng dẫn mở
+                </button>
+              </div>
+            )}
+
             {/* Người chở thiết bị nổi bật (Nếu mình không cần chở đồ) */}
             {!amICarryingGear && gearCarrier && (
               <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-3.5 shadow-sm space-y-2">
@@ -2962,6 +3029,105 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
                 className="w-full py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs cursor-pointer transition-colors"
               >
                 Để sau (Vẫn giữ app bật)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Hướng Dẫn & Chẩn Đoán Lỗi GPS */}
+      {showGpsDiagnosticsModal && (
+        <div className="fixed inset-0 z-60 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl max-w-sm w-full p-5 shadow-2xl text-left space-y-4 border border-slate-200 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full bg-rose-100 flex items-center justify-center text-rose-600 font-bold">
+                  📍
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-slate-900">Chẩn Đoán Lỗi Định Vị GPS</h3>
+                  <p className="text-[10px] text-slate-500">Tại sao trình duyệt không lấy được tọa độ?</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowGpsDiagnosticsModal(false)}
+                className="p-1.5 rounded-full hover:bg-slate-100 text-slate-400 hover:text-slate-700 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Thông tin kỹ thuật */}
+            <div className="space-y-2 text-xs">
+              {/* 1. Kiểm tra HTTPS */}
+              <div className={`p-2.5 rounded-xl border ${gpsDiagnosticInfo?.isHttps ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-rose-50 border-rose-300 text-rose-950 font-bold'}`}>
+                <div className="flex items-center justify-between">
+                  <span>1. Kết nối bảo mật (HTTPS)</span>
+                  <span>{gpsDiagnosticInfo?.isHttps ? '✓ Đạt chuẩn' : '❌ KHÔNG ĐẠT'}</span>
+                </div>
+                {!gpsDiagnosticInfo?.isHttps && (
+                  <p className="text-[11px] text-rose-800 font-normal mt-1 leading-snug">
+                    Web đang chạy qua <strong>HTTP</strong> ({gpsDiagnosticInfo?.protocol}//{gpsDiagnosticInfo?.host}). Trình duyệt Safari và Chrome trên điện thoại <strong>CHẶN 100%</strong> tính năng GPS trên HTTP vì lý do an ninh. Cần cài chứng chỉ SSL cho domain.
+                  </p>
+                )}
+              </div>
+
+              {/* 2. Kiểm tra In-App Browser */}
+              <div className={`p-2.5 rounded-xl border ${!gpsDiagnosticInfo?.isInApp ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-amber-50 border-amber-300 text-amber-950 font-bold'}`}>
+                <div className="flex items-center justify-between">
+                  <span>2. Ứng dụng duyệt web</span>
+                  <span>{!gpsDiagnosticInfo?.isInApp ? '✓ Trình duyệt ngoài' : '⚠️ Zalo / Messenger'}</span>
+                </div>
+                {gpsDiagnosticInfo?.isInApp && (
+                  <p className="text-[11px] text-amber-900 font-normal mt-1 leading-snug">
+                    Bạn đang mở link bên trong Zalo. Vui lòng bấm dấu <strong>"..."</strong> ở góc trên bên phải → <strong>"Mở bằng trình duyệt ngoài"</strong> (Safari / Chrome).
+                  </p>
+                )}
+              </div>
+
+              {/* 3. Kiểm tra Quyền hệ thống */}
+              <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-xl space-y-2">
+                <span className="font-bold text-slate-800 block">3. Hướng dẫn mở quyền trên điện thoại:</span>
+                <div className="text-[11px] text-slate-600 space-y-1.5 leading-snug">
+                  <div>
+                    <strong className="text-slate-900">📱 Nếu dùng iPhone (Safari):</strong>
+                    <ol className="list-decimal pl-4 mt-0.5 space-y-0.5 text-slate-600">
+                      <li>Vào <em>Cài đặt máy → Quyền riêng tư & Bảo mật → Dịch vụ định vị</em> → Bật <strong>BẬT</strong>.</li>
+                      <li>Kéo xuống chọn <strong>Trang web Safari</strong> → Chọn <em>Khi dùng ứng dụng</em>.</li>
+                      <li>Trên Safari bấm vào chữ <strong>aA</strong> ở thanh địa chỉ URL → <em>Cài đặt trang web → Vị trí → Cho phép</em>.</li>
+                    </ol>
+                  </div>
+                  <div className="pt-1 border-t border-slate-200">
+                    <strong className="text-slate-900">🤖 Nếu dùng Android (Chrome):</strong>
+                    <ol className="list-decimal pl-4 mt-0.5 space-y-0.5 text-slate-600">
+                      <li>Bật <strong>Vị trí / GPS</strong> trên thanh gạt nhanh của điện thoại.</li>
+                      <li>Bấm vào biểu tượng ổ khóa / cài đặt cạnh link web → <em>Quyền → Vị trí → Cho phép</em>.</li>
+                    </ol>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowGpsDiagnosticsModal(false);
+                  requestLocationPermissionAndPush(true);
+                }}
+                disabled={isRequestingGps}
+                className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-sm cursor-pointer transition-colors"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>{isRequestingGps ? 'Đang thử lại...' : 'Thử lại ngay'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowGpsDiagnosticsModal(false)}
+                className="py-2.5 px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs cursor-pointer transition-colors"
+              >
+                Đóng
               </button>
             </div>
           </div>
