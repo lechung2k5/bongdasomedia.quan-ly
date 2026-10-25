@@ -340,22 +340,22 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
       }
     };
 
-    // Bước 1: Thử lấy GPS chính xác cao (vệ tinh) với timeout 8s
+    // Bước 1: Gọi với enableHighAccuracy: false, timeout 25s để điện thoại lập tức hiện popup xin quyền và lấy toạ độ nhanh
     navigator.geolocation.getCurrentPosition(
       onGpsSuccess,
       (err) => {
-        // Bước 2: Nếu lỗi do Timeout (code 3) hoặc Không có tín hiệu (code 2), thử lại ngay với độ chính xác mạng Wifi/Cell
+        // Bước 2: Nếu lỗi do Timeout (code 3) hoặc Không có tín hiệu (code 2), thử lại với maximumAge 5 phút
         if (err.code === 2 || err.code === 3) {
           navigator.geolocation.getCurrentPosition(
             onGpsSuccess,
             onGpsError,
-            { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 }
+            { enableHighAccuracy: false, timeout: 20000, maximumAge: 300000 }
           );
         } else {
           onGpsError(err);
         }
       },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+      { enableHighAccuracy: false, timeout: 25000, maximumAge: 60000 }
     );
   };
 
