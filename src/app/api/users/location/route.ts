@@ -36,13 +36,19 @@ export async function POST(request: Request) {
       last_location_update: new Date(),
     };
 
-    if (lat !== undefined && lng !== undefined) {
-      updateData.current_lat = parseFloat(lat);
-      updateData.current_lng = parseFloat(lng);
+    if (lat !== undefined && lng !== undefined && lat !== null && lng !== null) {
+      const parsedLat = parseFloat(lat);
+      const parsedLng = parseFloat(lng);
+      if (!isNaN(parsedLat) && !isNaN(parsedLng)) {
+        updateData.current_lat = parsedLat;
+        updateData.current_lng = parsedLng;
+      }
     }
 
     if (operational_status !== undefined) {
-      updateData.operational_status = operational_status;
+      if (['IDLE', 'MOVING', 'WORKING'].includes(operational_status)) {
+        updateData.operational_status = operational_status;
+      }
     } else if (status !== undefined) {
       if (['IDLE', 'MOVING', 'WORKING'].includes(status)) {
         updateData.operational_status = status;

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Calendar,
   Package,
@@ -104,7 +104,7 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
     }
   }, [currentUser?.is_app_active]);
 
-  // GPS Tracking State (Tối ưu tiết kiệm pin nhất)
+  // GPS Tracking State (Tối ưu tiết kiệm pin & độ chính xác cao)
   const [isTrackingActive, setIsTrackingActive] = useState(currentUser?.operational_status === 'MOVING');
   const [currentCoord, setCurrentCoord] = useState<{ lat: number; lng: number }>({
     lat: currentUser?.current_lat || 10.7700,
@@ -113,8 +113,49 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
   const [gpsSimulationActive, setGpsSimulationActive] = useState(false);
   const [lastGpsSyncTime, setLastGpsSyncTime] = useState<string | null>(null);
 
+  // Mới: Kiểm tra môi trường & quyền GPS
+  const [isInAppBrowser, setIsInAppBrowser] = useState(false);
+  const [isNonHttps, setIsNonHttps] = useState(false);
+  const [gpsPermissionState, setGpsPermissionState] = useState<'prompt' | 'granted' | 'denied' | 'unknown'>('unknown');
+  const [gpsErrorText, setGpsErrorText] = useState<string | null>(null);
+  const [isRequestingGps, setIsRequestingGps] = useState(false);
+  const lastGpsPushTimeRef = useRef<number>(0);
+
   // Payout action loading
   const [payoutLoadingId, setPayoutLoadingId] = useState<number | string | null>(null);
+
+  // Phát hiện môi trường HTTP không bảo mật hoặc In-App browser (Zalo/Messenger)
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      // 1. Kiểm tra HTTPS (Bắt buộc cho Geolocation trên Mobile Browser)
+      if (
+        window.location.protocol !== 'https:' &&
+        window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1'
+      ) {
+        setIsNonHttps(true);
+      }
+
+      // 2. Kiểm tra In-App Browser (Zalo, Messenger, Facebook, TikTok...)
+      const ua = navigator.userAgent || '';
+      if (/FBAN|FBAV|Instagram|Line|Zalo|TikTok|MicroMessenger/i.test(ua)) {
+        setIsInAppBrowser(true);
+      }
+
+      // 3. Theo dõi trạng thái quyền Geolocation qua Permissions API (nếu browser hỗ trợ)
+      if (navigator.permissions && navigator.permissions.query) {
+        navigator.permissions
+          .query({ name: 'geolocation' })
+          .then((perm) => {
+            setGpsPermissionState(perm.state as any);
+            perm.onchange = () => {
+              setGpsPermissionState(perm.state as any);
+            };
+          })
+          .catch(() => {});
+      }
+    }
+  }, []);
 
   // Hàm chuyển đổi trạng thái Bật / Tắt App
   const handleToggleAppActive = async (targetState?: boolean) => {
@@ -139,6 +180,9 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
         );
         if (!nextState) {
           setGpsSimulationActive(false);
+        } else {
+          // Khi bật app, chủ động xin quyền vị trí ngay
+          requestLocationPermissionAndPush(true);
         }
         if (onRefreshUser) onRefreshUser();
       } else {
@@ -177,11 +221,24 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
   }, [currentUser?.id]);
 
   // Cập nhật vị trí GPS lên Server (CHỈ GỬI KHI ỨNG DỤNG ĐANG BẬT)
-  const pushLocationUpdate = async (lat: number, lng: number, operational_status?: string) => {
+  const pushLocationUpdate = async (
+    lat: number,
+    lng: number,
+    operational_status?: string,
+    force = false
+  ) => {
     if (!isAppActive) {
       console.log('App is inactive, skipping GPS push to server.');
       return;
     }
+
+    const now = Date.now();
+    // Throttle tối thiểu 6 giây giữa 2 lần POST lên server (tránh spam network khi xe chạy)
+    if (!force && now - lastGpsPushTimeRef.current < 6000) {
+      setCurrentCoord({ lat, lng });
+      return;
+    }
+    lastGpsPushTimeRef.current = now;
 
     try {
       const res = await fetch('/api/users/location', {
@@ -207,27 +264,149 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
     }
   };
 
-  // Battery-Saving GPS Mechanism:
-  // CHỈ tự động cập nhật GPS khi isAppActive === true VÀ operational_status === 'MOVING'.
-  // Khi IDLE hoặc WORKING hoặc khi ĐÃ TẮT APP, hoàn toàn tạm dừng GPS background để tiết kiệm pin và bảo vệ quyền riêng tư!
+  // Hàm chủ động yêu cầu quyền truy cập GPS từ trình duyệt
+  const requestLocationPermissionAndPush = (force = false, targetStatus?: string) => {
+    if (typeof window === 'undefined' || !('geolocation' in navigator)) {
+      setGpsErrorText('Trình duyệt của bạn không hỗ trợ định vị GPS.');
+      return;
+    }
+
+    setIsRequestingGps(true);
+    setGpsErrorText(null);
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setIsRequestingGps(false);
+        setGpsPermissionState('granted');
+        setGpsErrorText(null);
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setCurrentCoord({ lat, lng });
+        pushLocationUpdate(lat, lng, targetStatus || currentUser?.operational_status, true);
+        if (force) {
+          setStatusMessage('✓ Đã đồng bộ tọa độ GPS thành công!');
+        }
+      },
+      (err) => {
+        setIsRequestingGps(false);
+        console.warn('Geolocation error:', err);
+        if (err.code === 1) { // PERMISSION_DENIED
+          setGpsPermissionState('denied');
+          setGpsErrorText('Bạn đã từ chối quyền vị trí. Vui lòng cho phép trong cài đặt trang web trên điện thoại.');
+        } else if (err.code === 2) { // POSITION_UNAVAILABLE
+          setGpsErrorText('Không thể xác định vị trí. Vui lòng bật GPS trên điện thoại.');
+        } else if (err.code === 3) { // TIMEOUT
+          setGpsErrorText('Quá thời gian kết nối GPS. Hãy thử lại.');
+        } else {
+          setGpsErrorText(err.message || 'Không thể lấy tọa độ từ trình duyệt');
+        }
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+    );
+  };
+
+  // CHỦ ĐỘNG XIN QUYỀN VỊ TRÍ NGAY KHI VÀO ỨNG DỤNG (Nếu app đang bật)
+  useEffect(() => {
+    if (!isAppActive) return;
+    // Gọi ngay getCurrentPosition để trình duyệt bật prompt hỏi quyền lúc người dùng vừa vào trang
+    requestLocationPermissionAndPush(false);
+  }, [isAppActive]);
+
+  // THEO DÕI VỊ TRÍ LIÊN TỤC KHI ĐANG DI CHUYỂN (MOVING)
+  // Sử dụng watchPosition + Screen Wake Lock để giữ GPS active trên đường
   useEffect(() => {
     if (!isAppActive || currentUser?.operational_status !== 'MOVING' || gpsSimulationActive) return;
 
-    // Khoảng cách 25 giây gửi tọa độ 1 lần khi xe đang di chuyển
+    let watchId: number | null = null;
+    let wakeLockSentinel: any = null;
+
+    // Giữ màn hình sáng nếu trình duyệt hỗ trợ (tránh iOS/Android đóng băng JavaScript khi xe chạy)
+    if (typeof navigator !== 'undefined' && 'wakeLock' in navigator && (navigator as any).wakeLock) {
+      (navigator as any).wakeLock.request('screen').then((lock: any) => {
+        wakeLockSentinel = lock;
+      }).catch((e: any) => console.log('Wake Lock notice:', e));
+    }
+
+    if (typeof window !== 'undefined' && 'geolocation' in navigator) {
+      // 1. Lấy vị trí ngay lập tức lúc bắt đầu di chuyển
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          pushLocationUpdate(pos.coords.latitude, pos.coords.longitude, 'MOVING', true);
+        },
+        () => {},
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
+      );
+
+      // 2. Lắng nghe thay đổi tọa độ liên tục theo thời gian thực (watchPosition)
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          pushLocationUpdate(pos.coords.latitude, pos.coords.longitude, 'MOVING');
+        },
+        (err) => console.warn('watchPosition warning:', err),
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 8000 }
+      );
+    }
+
+    // 3. Dự phòng 1 interval mỗi 20 giây đề phòng thiết bị dừng tại chỗ đèn đỏ
     const interval = setInterval(() => {
-      if ('geolocation' in navigator) {
+      if (typeof window !== 'undefined' && 'geolocation' in navigator) {
         navigator.geolocation.getCurrentPosition(
           (pos) => {
             pushLocationUpdate(pos.coords.latitude, pos.coords.longitude, 'MOVING');
           },
           () => {},
-          { enableHighAccuracy: false, maximumAge: 30000, timeout: 10000 }
+          { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 }
         );
       }
-    }, 25000);
+    }, 20000);
 
-    return () => clearInterval(interval);
+    return () => {
+      if (watchId !== null && typeof window !== 'undefined' && 'geolocation' in navigator) {
+        navigator.geolocation.clearWatch(watchId);
+      }
+      clearInterval(interval);
+      if (wakeLockSentinel) {
+        wakeLockSentinel.release().catch(() => {});
+      }
+    };
   }, [isAppActive, currentUser?.operational_status, gpsSimulationActive]);
+
+  // Thay đổi trạng thái tác nghiệp nhanh (IDLE / MOVING / WORKING)
+  const handleSetOperationalStatus = async (status: 'IDLE' | 'MOVING' | 'WORKING') => {
+    try {
+      if (status === 'MOVING' && !isAppActive) {
+        setIsAppActive(true);
+      }
+
+      if (status === 'MOVING' && typeof window !== 'undefined' && 'geolocation' in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            pushLocationUpdate(pos.coords.latitude, pos.coords.longitude, status, true);
+          },
+          () => {
+            pushLocationUpdate(currentCoord.lat, currentCoord.lng, status, true);
+          },
+          { enableHighAccuracy: true, timeout: 10000 }
+        );
+      } else {
+        await pushLocationUpdate(currentCoord.lat, currentCoord.lng, status, true);
+      }
+
+      if (status === 'MOVING') {
+        setStatusMessage('🛵 Đã bật trạng thái: ĐANG DI CHUYỂN! Tọa độ GPS đang được gửi liên tục tới quản lý.');
+      } else if (status === 'IDLE') {
+        setStatusMessage('⚪ Đã chuyển trạng thái: SẴN SÀNG / NGHỈ NGƠI.');
+      } else {
+        setStatusMessage('📍 Đã chuyển trạng thái: ĐANG TÁC NGHIỆP TẠI SÂN.');
+      }
+
+      fetchMyData();
+      notifyLocalTabs();
+      if (onRefreshUser) onRefreshUser();
+    } catch (e) {
+      console.error('Error changing operational status:', e);
+    }
+  };
 
   // Handle Manual GPS Refresh (Tiết kiệm pin)
   const handleManualGpsRefresh = () => {
@@ -235,18 +414,7 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
       alert('Ứng dụng hiện đang TẮT. Vui lòng bấm BẬT APP để chia sẻ tọa độ GPS với quản lý.');
       return;
     }
-    if ('geolocation' in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          pushLocationUpdate(pos.coords.latitude, pos.coords.longitude, currentUser?.operational_status);
-          setStatusMessage('✓ Đã cập nhật tọa độ GPS mới nhất thành công');
-        },
-        () => {
-          setStatusMessage('Không thể lấy tọa độ từ trình duyệt');
-        },
-        { enableHighAccuracy: true, timeout: 8000 }
-      );
-    }
+    requestLocationPermissionAndPush(true, currentUser?.operational_status);
   };
 
   // Handle Staff Avatar Upload directly to AWS S3
@@ -799,6 +967,71 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
           </button>
         </div>
 
+        {/* ================= CẢNH BÁO MÔI TRƯỜNG & QUYỀN ĐỊNH VỊ GPS ================= */}
+        {isNonHttps && (
+          <div className="bg-rose-50 border-2 border-rose-400 rounded-2xl p-3.5 text-rose-950 space-y-1.5 shadow-sm">
+            <div className="flex items-center gap-2 font-black text-xs text-rose-800">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>CẢNH BÁO BẢO MẬT: CHƯA CÓ CHỨNG CHỈ HTTPS (SSL)</span>
+            </div>
+            <p className="text-[11px] text-rose-800 leading-snug">
+              Trình duyệt di động (Safari/Chrome) bắt buộc phải có kết nối bảo mật <strong>HTTPS</strong> mới cho phép kích hoạt GPS. Do web đang chạy qua HTTP, trình duyệt đã tự động chặn quyền vị trí. Quản trị viên cần cài đặt SSL/HTTPS cho domain.
+            </p>
+          </div>
+        )}
+
+        {isInAppBrowser && (
+          <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-3.5 text-amber-950 space-y-1.5 shadow-sm">
+            <div className="flex items-center gap-2 font-black text-xs text-amber-900">
+              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+              <span>BẠN ĐANG MỞ LINK TRONG ZALO / MESSENGER</span>
+            </div>
+            <p className="text-[11px] text-amber-900 leading-snug">
+              Trình duyệt nhúng của Zalo/Messenger thường chặn popup xin quyền GPS. Vui lòng bấm vào biểu tượng <strong>"..."</strong> ở góc trên bên phải màn hình → Chọn <strong>"Mở bằng trình duyệt ngoài"</strong> (Safari / Chrome) để quản lý theo dõi được bạn trên bản đồ.
+            </p>
+          </div>
+        )}
+
+        {gpsPermissionState === 'denied' && (
+          <div className="bg-rose-50 border-2 border-rose-400 rounded-2xl p-3.5 text-rose-950 space-y-2 shadow-sm">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 font-black text-xs text-rose-800">
+                <MapPin className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>QUYỀN VỊ TRÍ ĐANG BỊ TỪ CHỐI</span>
+              </div>
+              <button
+                onClick={() => requestLocationPermissionAndPush(true)}
+                disabled={isRequestingGps}
+                className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-[10px] font-bold cursor-pointer"
+              >
+                {isRequestingGps ? 'Đang thử...' : 'Thử lại'}
+              </button>
+            </div>
+            <p className="text-[11px] text-rose-800 leading-snug">
+              Điện thoại đang chặn quyền vị trí của trang web này. Vui lòng bấm vào biểu tượng ổ khóa hoặc <strong>aA</strong> trên thanh địa chỉ trình duyệt → <em>Cài đặt trang web → Vị trí → Cho phép</em>.
+            </p>
+          </div>
+        )}
+
+        {gpsPermissionState !== 'denied' && gpsPermissionState !== 'granted' && !isNonHttps && !isInAppBrowser && (
+          <div className="bg-blue-50 border border-blue-200 rounded-2xl p-3 flex items-center justify-between text-xs text-blue-900 shadow-xs">
+            <div className="flex items-center gap-2">
+              <MapPin className="w-4 h-4 text-blue-600 shrink-0" />
+              <div>
+                <div className="font-bold">Chưa cấp quyền vị trí GPS</div>
+                <div className="text-[11px] text-blue-700">Cho phép để quản lý theo dõi lộ trình và hỗ trợ điều phối ca làm</div>
+              </div>
+            </div>
+            <button
+              onClick={() => requestLocationPermissionAndPush(true)}
+              disabled={isRequestingGps}
+              className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold shrink-0 cursor-pointer transition-colors"
+            >
+              {isRequestingGps ? 'Đang hỏi...' : 'Cấp quyền GPS'}
+            </button>
+          </div>
+        )}
+
         {/* ================= 0b. CẢNH BÁO NGUY CƠ ĐI MUỘN (TRƯỚC GIỜ BÓNG LĂN 30 PHÚT) ================= */}
         {punctualityEval && punctualityEval.riskLevel === 'CRITICAL_LATE' && (
           <div className="bg-rose-50 border-2 border-rose-500/80 rounded-2xl p-4 text-rose-950 space-y-2 shadow-md animate-pulse">
@@ -1216,6 +1449,35 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
                     {/* Check-in tại sân & Kết thúc ca làm việc */}
                     {!isCompleted && (
                       <div className="pt-2 border-t border-slate-200/80 space-y-2">
+                        {/* 0. NÚT BẮT ĐẦU DI CHUYỂN TỚI SÂN (BẬT GPS LIÊN TỤC) */}
+                        {!hasCheckedInStadium && currentUser?.operational_status !== 'WORKING' && (
+                          currentUser?.operational_status !== 'MOVING' ? (
+                            <button
+                              type="button"
+                              onClick={() => handleSetOperationalStatus('MOVING')}
+                              className="w-full py-2.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-extrabold text-xs flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+                            >
+                              <Navigation className="w-4 h-4" />
+                              <span>🛵 BẮT ĐẦU DI CHUYỂN TỚI SÂN (BẬT GPS LIVE)</span>
+                            </button>
+                          ) : (
+                            <div className="bg-amber-50 border border-amber-300 rounded-xl p-2.5 flex items-center justify-between text-xs font-bold text-amber-900 shadow-2xs">
+                              <span className="flex items-center gap-1.5">
+                                <Navigation className="w-4 h-4 text-amber-600 animate-bounce" />
+                                <span>🛵 Đang di chuyển tới sân (GPS Live liên tục)</span>
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleSetOperationalStatus('IDLE')}
+                                className="text-[10px] bg-amber-200 hover:bg-amber-300 text-amber-900 px-2 py-0.5 rounded font-bold cursor-pointer"
+                                title="Tạm dừng nếu chưa khởi hành"
+                              >
+                                Tạm dừng
+                              </button>
+                            </div>
+                          )
+                        )}
+
                         {/* 1. NÚT CHECK-IN ĐÃ TỚI SÂN BÓNG */}
                         {!hasCheckedInStadium && currentUser?.operational_status !== 'WORKING' ? (
                           <button
@@ -1568,20 +1830,71 @@ export default function StaffMobileView({ currentUser, onRefreshUser, onLogout }
         {/* ================= TAB 3: ĐỊNH VỊ GPS (TỐI ƯU PIN NHẤT) ================= */}
         {activeTab === 'tracking' && (
           <div className="space-y-4">
-            {/* Banner chế độ tiết kiệm pin */}
-            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 flex items-center justify-between text-xs text-emerald-900">
+            {/* Thanh chọn nhanh trạng thái của bạn */}
+            <div className="bg-white border border-slate-200 rounded-2xl p-3 shadow-xs space-y-2">
+              <div className="text-[11px] font-bold text-slate-700 uppercase tracking-wider flex items-center justify-between">
+                <span>Trạng thái hoạt động của bạn</span>
+                <span className="text-[10px] text-slate-400 font-normal">Bấm để thay đổi</span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleSetOperationalStatus('IDLE')}
+                  className={`py-2 px-1.5 rounded-xl text-center text-xs font-bold border transition-all cursor-pointer ${
+                    currentUser?.operational_status === 'IDLE'
+                      ? 'bg-slate-800 text-white border-slate-900 shadow-xs'
+                      : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  <div className="text-base mb-0.5">⚪</div>
+                  <div>Sẵn sàng / Rảnh</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSetOperationalStatus('MOVING')}
+                  className={`py-2 px-1.5 rounded-xl text-center text-xs font-bold border transition-all cursor-pointer ${
+                    currentUser?.operational_status === 'MOVING'
+                      ? 'bg-amber-500 text-slate-950 border-amber-600 shadow-xs animate-pulse'
+                      : 'bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100'
+                  }`}
+                >
+                  <div className="text-base mb-0.5">🛵</div>
+                  <div>Đang di chuyển</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSetOperationalStatus('WORKING')}
+                  className={`py-2 px-1.5 rounded-xl text-center text-xs font-bold border transition-all cursor-pointer ${
+                    currentUser?.operational_status === 'WORKING'
+                      ? 'bg-emerald-600 text-white border-emerald-700 shadow-xs'
+                      : 'bg-emerald-50 text-emerald-900 border-emerald-200 hover:bg-emerald-100'
+                  }`}
+                >
+                  <div className="text-base mb-0.5">📍</div>
+                  <div>Đang tác nghiệp</div>
+                </button>
+              </div>
+            </div>
+
+            {/* Banner trạng thái định vị GPS */}
+            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 flex items-center justify-between text-xs text-emerald-900 shadow-xs">
               <div className="flex items-center gap-2">
                 <BatteryCharging className="w-5 h-5 text-emerald-600 shrink-0" />
                 <div>
-                  <div className="font-bold">Chế độ GPS siêu tiết kiệm pin</div>
-                  <div className="text-[11px] text-emerald-700">Tự động ngắt GPS khi đến sân, chỉ bật khi di chuyển</div>
+                  <div className="font-bold flex items-center gap-1.5">
+                    <span>GPS {currentUser?.operational_status === 'MOVING' ? '🟢 Đang truyền Live liên tục' : '⚪ Tạm dừng ngắt pin'}</span>
+                  </div>
+                  <div className="text-[11px] text-emerald-700">
+                    {lastGpsSyncTime ? `Lần đồng bộ cuối: ${lastGpsSyncTime}` : 'Đã sẵn sàng đồng bộ GPS'}
+                  </div>
                 </div>
               </div>
               <button
                 onClick={handleManualGpsRefresh}
-                className="px-2.5 py-1.5 rounded-lg bg-white border border-emerald-300 text-emerald-800 text-[11px] font-bold shadow-xs hover:bg-emerald-50 transition-colors shrink-0"
+                disabled={isRequestingGps}
+                className="px-2.5 py-1.5 rounded-lg bg-white border border-emerald-300 text-emerald-800 text-[11px] font-bold shadow-xs hover:bg-emerald-50 transition-colors shrink-0 cursor-pointer"
               >
-                Cập nhật ngay
+                {isRequestingGps ? 'Đang lấy...' : 'Cập nhật ngay'}
               </button>
             </div>
 

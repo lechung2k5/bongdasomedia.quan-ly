@@ -6,10 +6,7 @@ declare global {
 
 export const realtimeEmitter: EventEmitter = global.__realtimeEmitter || new EventEmitter();
 realtimeEmitter.setMaxListeners(500);
-
-if (process.env.NODE_ENV !== 'production') {
-  global.__realtimeEmitter = realtimeEmitter;
-}
+global.__realtimeEmitter = realtimeEmitter;
 
 export function broadcastRealtimeEvent(event: { type: string; payload?: any }) {
   try {
